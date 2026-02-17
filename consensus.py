@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""
+CONSENSUS Strategy Bot - Real Trading on Kalshi
+
+Only places trades when both PREVIOUS (last market result) and MOMENTUM
+(BTC price direction) signals agree.
+
+Requires environment variables:
+  KALSHI_API_KEY_ID       - Kalshi API key ID
+  KALSHI_PRIVATE_KEY_PATH - Path to RSA private key file
+  KALSHI_USE_DEMO         - "true" for demo API, "false" for production
+  DRY_RUN                 - "true" to simulate orders without executing
+"""
+
+import base64
+import csv
+import os
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import requests
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
+
+# Configuration
+SERIES_TICKER = os.getenv("KALSHI_EVENT_TICKER_PREFIX", "KXBTC15M")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "5"))
+STAKE_USD = float(os.getenv("STAKE_USD", "5.0"))
+MOMENTUM_WINDOW_SECONDS = int(os.getenv("MOMENTUM_WINDOW_SECONDS", "60"))
+TRADES_CSV = Path(os.getenv("CONSENSUS_TRADES_CSV", "data/consensus_trades.csv"))
+
+
+def get_api_base():
+    """Return API base URL based on KALSHI_USE_DEMO env var."""
+    use_demo = os.getenv("KALSHI_USE_DEMO", "true").lower() == "true"
+    if use_demo:
+        return "https://demo-api.kalshi.co/trade-api/v2"
+    return "https://api.elections.kalshi.com/trade-api/v2"
+
+
+def load_private_key():
+    """Load RSA private key from file."""
+    key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "")
+    if not key_path:
+        raise ValueError("KALSHI_PRIVATE_KEY_PATH environment variable required")
+
+    key_path = os.path.expanduser(key_path)
+    with open(key_path, "rb") as f:
+        private_key = serialization.load_pem_private_key(f.read(), password=None)
+    return private_key
+
+
+class KalshiClient:
+    """Authenticated Kalshi API client using RSA key signing."""
+
+    def __init__(self):
+        self.api_base = get_api_base()
+        self.api_key_id = os.getenv("KALSHI_API_KEY_ID", "")
+        if not self.api_key_id:
+            raise ValueError("KALSHI_API_KEY_ID environment variable required")
+
+        self.private_key = load_private_key()
+        self.session = requests.Session()
+
+    def _sign_request(self, method: str, path: str, timestamp: str) -> str:
+        """Generate RSA-PSS signature for request."""
+        # Message format: timestamp + method + /trade-api/v2 + path (without query params)
+        # Strip query params from path for signing
+        path_without_query = path.split("?")[0]
+        message = f"{timestamp}{method}/trade-api/v2{path_without_query}"
+        signature = self.private_key.sign(
+            message.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def _request(self, method: str, path: str, **kwargs):
+        """Make authenticated request to Kalshi API."""
+        url = f"{self.api_base}{path}"
+        timestamp = str(int(time.time() * 1000))
+        signature = self._sign_request(method.upper(), path, timestamp)
+
+        headers = kwargs.pop("headers", {})
+        headers.update({
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "Content-Type": "application/json",
+        })
+
+        resp = self.session.request(method, url, headers=headers, **kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_balance(self):
+        """Get account balance."""
+        return self._request("GET", "/portfolio/balance", timeout=20)
+
+    def get_markets(self, series_ticker, status="open", limit=50):
+        """Get markets for a series."""
+        params = {"series_ticker": series_ticker, "status": status, "limit": limit}
+        resp = self._request("GET", "/markets", params=params, timeout=20)
+        return resp.get("markets", [])
+
+    def get_market(self, ticker):
+        """Get a specific market."""
+        resp = self._request("GET", f"/markets/{ticker}", timeout=20)
+        return resp.get("market", {})
+
+    def place_order(self, ticker, side, contracts, price_cents, dry_run=False):
+        """
+        Place a limit order.
+
+        Args:
+            ticker: Market ticker
+            side: "yes" or "no"
+            contracts: Number of contracts
+            price_cents: Price per contract in cents (1-99)
+            dry_run: If True, simulate without executing
+
+        Returns:
+            Order response dict
+        """
+        if dry_run:
+            return {
+                "order": {
+                    "order_id": f"DRY-RUN-{uuid.uuid4()}",
+                    "status": "simulated",
+                    "ticker": ticker,
+                    "side": side,
+                    "count": contracts,
+                }
+            }
+
+        order = {
+            "ticker": ticker,
+            "client_order_id": str(uuid.uuid4()),
+            "type": "limit",
+            "action": "buy",
+            "side": side,
+            "count": contracts,
+        }
+
+        # Set price based on side
+        if side == "yes":
+            order["yes_price"] = price_cents
+        else:
+            order["no_price"] = price_cents
+
+        return self._request("POST", "/portfolio/orders", json=order, timeout=30)
+
+    def get_positions(self):
+        """Get current positions."""
+        resp = self._request("GET", "/portfolio/positions", timeout=20)
+        return resp.get("market_positions", [])
+
+
+def get_btc_price():
+    """Get current BTC price from Coinbase."""
+    resp = requests.get(
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return float(resp.json()["data"]["amount"])
+
+
+def get_open_market(client):
+    """Get the next expiring open market."""
+    markets = client.get_markets(SERIES_TICKER, status="open")
+    now = datetime.now(timezone.utc)
+    candidates = []
+
+    for market in markets:
+        close_time = market.get("close_time")
+        if not close_time:
+            continue
+        exp = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+        if exp > now:
+            candidates.append((exp, market))
+
+    if not candidates:
+        return None
+
+    _, best = min(candidates, key=lambda x: x[0])
+    return best
+
+
+def get_settled_side(market):
+    """Return 'yes' or 'no' if market is settled, else None."""
+    result = market.get("result")
+    if result in ("yes", "no"):
+        return result
+    return None
+
+
+def load_trades():
+    """Load trades from CSV."""
+    if not TRADES_CSV.exists():
+        return []
+    with TRADES_CSV.open() as f:
+        return list(csv.DictReader(f))
+
+
+def save_trades(trades):
+    """Save trades to CSV."""
+    if not trades:
+        return
+    TRADES_CSV.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "time",
+        "buy_ticker",
+        "buy_side",
+        "stake_usd",
+        "price_usd",
+        "contracts",
+        "order_id",
+        "prev_signal",
+        "mom_signal",
+        "outcome",
+        "payout_usd",
+        "profit_usd",
+    ]
+    with TRADES_CSV.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(trades)
+
+
+def calc_stats(trades):
+    """Calculate P&L stats."""
+    total_staked = 0.0
+    total_profit = 0.0
+    wins = 0
+    losses = 0
+    pending = 0
+
+    for t in trades:
+        total_staked += float(t.get("stake_usd", 0))
+        profit = t.get("profit_usd", "")
+        if profit != "":
+            p = float(profit)
+            total_profit += p
+            if p > 0:
+                wins += 1
+            else:
+                losses += 1
+        else:
+            pending += 1
+
+    return {
+        "total_staked": total_staked,
+        "total_profit": total_profit,
+        "wins": wins,
+        "losses": losses,
+        "pending": pending,
+    }
+
+
+def main():
+    load_dotenv()
+
+    dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+
+    print("=" * 60)
+    print("CONSENSUS STRATEGY BOT - REAL TRADING")
+    print("=" * 60)
+    print(f"Series: {SERIES_TICKER}")
+    print(f"Stake: ${STAKE_USD} per trade")
+    print(f"Momentum window: {MOMENTUM_WINDOW_SECONDS}s")
+    print(f"Poll interval: {POLL_SECONDS}s")
+    print(f"Trades CSV: {TRADES_CSV}")
+    print(f"DRY RUN: {dry_run}")
+    print()
+
+    # Initialize client
+    try:
+        client = KalshiClient()
+        print(f"API: {client.api_base}")
+        print(f"API Key: {client.api_key_id[:8]}...")
+    except Exception as e:
+        print(f"Client init failed: {e}")
+        return 1
+
+    # Show balance
+    try:
+        balance = client.get_balance()
+        balance_usd = balance.get("balance", 0) / 100
+        print(f"Account balance: ${balance_usd:.2f}")
+    except Exception as e:
+        print(f"Could not fetch balance: {e}")
+        return 1
+
+    print()
+
+    # State
+    current_ticker = None
+    pending_previous = None
+    trades = load_trades()
+    traded_tickers = {t.get("buy_ticker") for t in trades if t.get("buy_ticker")}
+
+    # BTC price history
+    btc_prices = deque(maxlen=100)
+
+    # Signals per market: {ticker: {"PREVIOUS": side, "MOMENTUM": side}}
+    signals = {}
+
+    # Print initial stats
+    stats = calc_stats(trades)
+    print(f"Loaded {len(trades)} trades from CSV")
+    print(
+        f"Stats: ${stats['total_profit']:+.2f} profit | "
+        f"{stats['wins']}W/{stats['losses']}L | {stats['pending']} pending"
+    )
+    print()
+    print("Starting bot loop...")
+    print("-" * 60)
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+
+            # Get BTC price
+            try:
+                btc_price = get_btc_price()
+                btc_prices.append((now, btc_price))
+            except Exception as e:
+                btc_price = None
+                print(f"  [BTC price error: {e}]")
+
+            # Get current market
+            market = get_open_market(client)
+
+            if not market:
+                print(f"[{now.strftime('%H:%M:%S')}] No open market found")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            ticker = market["ticker"]
+            yes_ask = market.get("yes_ask", 0) / 100
+            no_ask = market.get("no_ask", 0) / 100
+
+            close_time_str = market.get("close_time", "")
+            close_time = (
+                datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                if close_time_str
+                else None
+            )
+            time_to_close = (close_time - now).total_seconds() if close_time else None
+
+            # Initialize signals for this ticker
+            if ticker not in signals:
+                signals[ticker] = {"PREVIOUS": None, "MOMENTUM": None}
+
+            # Detect market change
+            if current_ticker is None:
+                current_ticker = ticker
+            elif ticker != current_ticker:
+                pending_previous = current_ticker
+                current_ticker = ticker
+                print(f"  Market changed: {pending_previous} -> {ticker}")
+
+            # Check pending trades for settlement
+            updated = False
+            for trade in trades:
+                if trade.get("outcome"):
+                    continue
+
+                buy_ticker = trade.get("buy_ticker")
+                if not buy_ticker:
+                    continue
+
+                try:
+                    m = client.get_market(buy_ticker)
+                    result = get_settled_side(m)
+                    if result:
+                        buy_side = trade.get("buy_side")
+                        contracts = float(trade.get("contracts", 0))
+                        stake = float(trade.get("stake_usd", 0))
+
+                        won = result == buy_side
+                        payout = contracts if won else 0
+                        profit = payout - stake
+
+                        trade["outcome"] = "WIN" if won else "LOSS"
+                        trade["payout_usd"] = round(payout, 4)
+                        trade["profit_usd"] = round(profit, 4)
+                        updated = True
+
+                        print(
+                            f"  ** SETTLED {buy_ticker}: {trade['outcome']} ${profit:+.2f}"
+                        )
+                except Exception:
+                    pass
+
+            if updated:
+                save_trades(trades)
+
+            # Print status
+            stats = calc_stats(trades)
+            btc_str = f"BTC=${btc_price:,.0f}" if btc_price else "BTC=?"
+            time_str = f"{time_to_close:.0f}s" if time_to_close else "?"
+            mode_str = "[DRY]" if dry_run else "[LIVE]"
+            print(
+                f"[{now.strftime('%H:%M:%S')}] {mode_str} {ticker} ({time_str}) | "
+                f"yes=${yes_ask:.2f} no=${no_ask:.2f} | {btc_str} | "
+                f"P&L: ${stats['total_profit']:+.2f}"
+            )
+
+            # Skip if already traded this market
+            if ticker in traded_tickers:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # === COMPUTE SIGNALS ===
+
+            # Signal 1: PREVIOUS (from previous market result)
+            if pending_previous and signals[ticker]["PREVIOUS"] is None:
+                try:
+                    prev_market = client.get_market(pending_previous)
+                    settled = get_settled_side(prev_market)
+                    if settled:
+                        signals[ticker]["PREVIOUS"] = settled
+                        print(f"  PREVIOUS signal: {settled} (from {pending_previous})")
+                except Exception as e:
+                    print(f"  Could not get previous market: {e}")
+
+            # Signal 2: MOMENTUM (from BTC price direction)
+            if (
+                pending_previous
+                and signals[ticker]["MOMENTUM"] is None
+                and len(btc_prices) >= 2
+            ):
+                cutoff = now - timedelta(seconds=MOMENTUM_WINDOW_SECONDS)
+                old_prices = [(t, p) for t, p in btc_prices if t <= cutoff]
+
+                if old_prices:
+                    _, old_price = old_prices[-1]
+                    _, current_price = btc_prices[-1]
+
+                    if current_price > old_price:
+                        side = "yes"  # Price rising
+                    else:
+                        side = "no"  # Price falling
+
+                    signals[ticker]["MOMENTUM"] = side
+                    pct_change = ((current_price - old_price) / old_price) * 100
+                    print(f"  MOMENTUM signal: {side} (BTC {pct_change:+.3f}%)")
+
+            # === CONSENSUS DECISION ===
+            prev_signal = signals[ticker].get("PREVIOUS")
+            mom_signal = signals[ticker].get("MOMENTUM")
+
+            if prev_signal and mom_signal:
+                if prev_signal == mom_signal:
+                    # CONSENSUS: both signals agree - PLACE REAL TRADE
+                    side = prev_signal
+                    price = yes_ask if side == "yes" else no_ask
+                    price_cents = int(price * 100)
+
+                    # Calculate contracts
+                    if price <= 0:
+                        print(f"  Invalid price ${price}, skipping")
+                        traded_tickers.add(ticker)
+                        time.sleep(POLL_SECONDS)
+                        continue
+
+                    contracts = int(STAKE_USD / price)
+                    if contracts < 1:
+                        contracts = 1
+
+                    print()
+                    print(f"  >>> CONSENSUS SIGNAL: {side.upper()} <<<")
+                    print(
+                        f"  Placing order: BUY {contracts} {side} @ ${price:.2f} "
+                        f"(${contracts * price:.2f} total)"
+                    )
+
+                    try:
+                        order_resp = client.place_order(
+                            ticker=ticker,
+                            side=side,
+                            contracts=contracts,
+                            price_cents=price_cents,
+                            dry_run=dry_run,
+                        )
+                        order = order_resp.get("order", {})
+                        order_id = order.get("order_id", "?")
+                        print(f"  Order placed! ID: {order_id}")
+
+                        trade = {
+                            "time": now.isoformat(),
+                            "buy_ticker": ticker,
+                            "buy_side": side,
+                            "stake_usd": round(contracts * price, 4),
+                            "price_usd": round(price, 4),
+                            "contracts": contracts,
+                            "order_id": order_id,
+                            "prev_signal": prev_signal,
+                            "mom_signal": mom_signal,
+                            "outcome": "",
+                            "payout_usd": "",
+                            "profit_usd": "",
+                        }
+                        trades.append(trade)
+                        save_trades(trades)
+                        traded_tickers.add(ticker)
+
+                    except Exception as e:
+                        print(f"  ORDER FAILED: {e}")
+                        traded_tickers.add(ticker)
+
+                    print()
+
+                else:
+                    # Signals disagree - no trade
+                    print(
+                        f"  Signals disagree (PREV={prev_signal}, MOM={mom_signal}) - NO TRADE"
+                    )
+                    traded_tickers.add(ticker)
+
+            # Clear pending_previous after signals computed
+            if (
+                pending_previous
+                and signals[ticker]["PREVIOUS"] is not None
+                and signals[ticker]["MOMENTUM"] is not None
+            ):
+                pending_previous = None
+
+            time.sleep(POLL_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\n")
+            print("=" * 60)
+            print("STOPPED - FINAL STATS")
+            print("=" * 60)
+            stats = calc_stats(trades)
+            print(f"Total trades: {len(trades)}")
+            print(f"Wins: {stats['wins']} | Losses: {stats['losses']} | Pending: {stats['pending']}")
+            print(f"Total staked: ${stats['total_staked']:.2f}")
+            print(f"Total profit: ${stats['total_profit']:+.2f}")
+            if stats["total_staked"] > 0:
+                roi = (stats["total_profit"] / stats["total_staked"]) * 100
+                print(f"ROI: {roi:.1f}%")
+            break
+
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(POLL_SECONDS)
+
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
