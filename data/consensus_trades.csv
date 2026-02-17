@@ -1,5 +1,0 @@
-time,buy_ticker,buy_side,stake_usd,price_usd,contracts,order_id,prev_signal,mom_signal,outcome,payout_usd,profit_usd
-2026-02-17T17:01:12.457340+00:00,KXBTC15M-26FEB171215-15,no,4.59,0.51,9,6db92bc5-f66e-49d1-9ffe-b0a6242e7cda,no,no,WIN,9.0,4.41
-2026-02-17T17:30:58.532296+00:00,KXBTC15M-26FEB171245-45,yes,5.0,0.5,10,4fc1ba63-180e-42fa-a3ca-c31868563016,yes,yes,LOSS,0,-5.0
-2026-02-17T17:45:44.565178+00:00,KXBTC15M-26FEB171300-00,no,4.77,0.53,9,f78bba4b-464f-409a-b5ef-f8e1e7a1f134,no,no,LOSS,0,-4.77
-2026-02-17T18:01:01.202375+00:00,KXBTC15M-26FEB171315-15,yes,4.73,0.43,11,a3f87d3e-ea19-4f3a-8e89-2ebdd9b0b8b4,yes,yes,,,
