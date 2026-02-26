@@ -12,6 +12,9 @@ from genetic.config import (
     INITIAL_BANKROLL,
     POPULATION_SIZE,
     PROGRESS_LOG_INTERVAL_TICKS,
+    SETTLEMENT_CHECK_TICKS,
+    SETTLEMENT_WAIT_HOURS,
+    SETTLEMENT_WAIT_POLL_SECONDS,
     TICK_INTERVAL_SECONDS,
 )
 from genetic.engine import PaperTradingEngine
@@ -129,8 +132,11 @@ def _run_generation(
 
     while (time.time() - gen_start) < GENERATION_DURATION_SECONDS:
         try:
-            # Settle completed markets
-            engine.settle_markets()
+            # Settle completed markets (targeted check every N ticks)
+            if tick_count > 0 and tick_count % SETTLEMENT_CHECK_TICKS == 0:
+                engine.settle_with_targeted_check()
+            else:
+                engine.settle_markets()
 
             # Each bot evaluates and trades
             for bot in bots:
@@ -140,7 +146,7 @@ def _run_generation(
 
             # Periodic progress log
             if tick_count % PROGRESS_LOG_INTERVAL_TICKS == 0:
-                log_tick_progress(logger, gen_num, tick_count, bots)
+                log_tick_progress(logger, gen_num, tick_count, bots, feed)
 
             # Periodic checkpoint
             if tick_count % CHECKPOINT_INTERVAL_TICKS == 0:
@@ -157,9 +163,50 @@ def _run_generation(
             logger.error(f"Tick error: {e}", exc_info=True)
             time.sleep(TICK_INTERVAL_SECONDS)
 
-    # Generation complete - save, log, evolve
+    # Trading period complete
     logger.info(f"Generation {gen_num} trading period complete ({tick_count} ticks)")
-    engine.settle_markets()
+    engine.settle_with_targeted_check()
+
+    # Settlement wait: keep checking until positions settle or timeout
+    remaining = engine.total_open_positions()
+    if remaining > 0:
+        logger.info(
+            f"Waiting up to {SETTLEMENT_WAIT_HOURS}h for {remaining} "
+            f"open positions to settle..."
+        )
+        wait_start = time.time()
+        max_wait = SETTLEMENT_WAIT_HOURS * 3600
+
+        try:
+            while (time.time() - wait_start) < max_wait:
+                engine.settle_with_targeted_check()
+                settled = engine.total_settled()
+                remaining = engine.total_open_positions()
+                elapsed_min = (time.time() - wait_start) / 60
+
+                logger.info(
+                    f"[Settlement wait {elapsed_min:.0f}m] "
+                    f"Settled: {settled} | Remaining: {remaining}"
+                )
+
+                if remaining == 0:
+                    logger.info("All positions settled!")
+                    break
+
+                time.sleep(SETTLEMENT_WAIT_POLL_SECONDS)
+        except KeyboardInterrupt:
+            logger.info("Interrupted during settlement wait. Saving state...")
+            engine.force_close_remaining()
+            _save_and_log(logger, gen_num, bots, tick_count)
+            raise
+
+        if remaining > 0:
+            logger.info(
+                f"Settlement timeout: {remaining} positions still open, "
+                f"force-closing as losses"
+            )
+            engine.force_close_remaining()
+
     _save_and_log(logger, gen_num, bots, tick_count)
 
     # Evolve

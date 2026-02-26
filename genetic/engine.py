@@ -23,6 +23,7 @@ class PaperPosition:
     entry_price: float = 0.0  # Per contract, in dollars
     cost: float = 0.0  # contracts * entry_price
     entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    close_time: datetime | None = None  # Market close time (for settlement scheduling)
 
     # Filled on settlement
     settled: bool = False
@@ -77,6 +78,30 @@ class BotAccount:
     @property
     def n_open(self) -> int:
         return len(self.open_positions)
+
+    def unrealized_pnl(self, feed: MarketDataFeed) -> float:
+        """Estimate PnL of open positions using current bid prices."""
+        pnl = 0.0
+        for ticker, pos in self.open_positions.items():
+            snap = feed.get_market(ticker)
+            if not snap:
+                continue
+            if pos.side == "yes":
+                current_value = pos.contracts * snap.yes_bid
+            else:
+                current_value = pos.contracts * snap.no_bid
+            pnl += current_value - pos.cost
+        return pnl
+
+    def total_pnl(self, feed: MarketDataFeed) -> float:
+        """Realized + unrealized PnL."""
+        return self.realized_pnl + self.unrealized_pnl(feed)
+
+    def total_roi_pct(self, feed: MarketDataFeed) -> float:
+        """ROI including unrealized positions."""
+        if self.initial_bankroll <= 0:
+            return 0.0
+        return (self.total_pnl(feed) / self.initial_bankroll) * 100
 
 
 class PaperTradingEngine:
@@ -159,6 +184,7 @@ class PaperTradingEngine:
             contracts=contracts,
             entry_price=fill_price,
             cost=cost,
+            close_time=snap.close_time,
         )
         acct.cash -= cost
         acct.open_positions[market_ticker] = pos
@@ -166,11 +192,50 @@ class PaperTradingEngine:
         acct.trades_today += 1
         return pos
 
+    def get_open_tickers(self) -> set[str]:
+        """Get all unique tickers with open positions across all accounts."""
+        tickers: set[str] = set()
+        for acct in self.accounts.values():
+            tickers.update(acct.open_positions.keys())
+        return tickers
+
+    def get_closeable_tickers(self) -> set[str]:
+        """Get open tickers whose markets have passed their close time."""
+        now = datetime.now(timezone.utc)
+        tickers: set[str] = set()
+        for acct in self.accounts.values():
+            for ticker, pos in acct.open_positions.items():
+                if pos.close_time and pos.close_time <= now:
+                    tickers.add(ticker)
+        return tickers
+
+    def total_open_positions(self) -> int:
+        """Total open positions across all accounts."""
+        return sum(len(a.open_positions) for a in self.accounts.values())
+
+    def total_settled(self) -> int:
+        """Total settled positions across all accounts."""
+        return sum(a.n_settled for a in self.accounts.values())
+
     def settle_markets(self):
         """
-        Check all open positions against settled market data.
+        Check all open positions against settled market data (cached).
         Called each tick by the main loop.
         """
+        self._apply_settlements()
+
+    def settle_with_targeted_check(self):
+        """
+        Check specific tickers we hold via the API, then settle.
+        Only checks markets that have passed their close time.
+        """
+        closeable = self.get_closeable_tickers()
+        if closeable:
+            self.feed.check_specific_tickers(closeable)
+        self._apply_settlements()
+
+    def _apply_settlements(self):
+        """Apply any cached settlement data to open positions."""
         for bot_id, acct in self.accounts.items():
             to_close: list[str] = []
             for ticker, pos in acct.open_positions.items():
@@ -192,3 +257,23 @@ class PaperTradingEngine:
 
             for ticker in to_close:
                 del acct.open_positions[ticker]
+
+    def force_close_remaining(self):
+        """
+        Force-close all remaining open positions as total losses.
+        Called after settlement timeout so fitness reflects the risk of unsettled trades.
+        """
+        now = datetime.now(timezone.utc)
+        for acct in self.accounts.values():
+            for ticker, pos in list(acct.open_positions.items()):
+                pos.settled = True
+                pos.result = "timeout"
+                pos.payout = 0.0
+                pos.profit = -pos.cost
+                pos.settle_time = now
+
+                acct.cash += pos.payout
+                acct.daily_pnl += pos.profit
+                acct.closed_positions.append(pos)
+
+            acct.open_positions.clear()

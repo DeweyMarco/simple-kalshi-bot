@@ -178,8 +178,7 @@ class MarketDataFeed:
                 self.histories[ticker].append(snap.fetched_at, snap.yes_ask)
 
     def _check_settlements(self):
-        """Check for recently settled markets."""
-        cutoff_ts = int(time.time()) - 7200  # Last 2 hours
+        """Check for recently settled markets (bulk, background thread)."""
         now = datetime.now(timezone.utc)
 
         try:
@@ -192,16 +191,30 @@ class MarketDataFeed:
                     if snap:
                         self.settled[snap.ticker] = snap
 
-                # Prune old settlements (older than 2 hours)
-                stale = [
-                    t for t, s in self.settled.items()
-                    if (now - s.fetched_at).total_seconds() > 7200
-                ]
-                for t in stale:
-                    del self.settled[t]
-
         except Exception as e:
             logger.error(f"Settlement check error: {e}")
+
+    def check_specific_tickers(self, tickers: set[str]) -> None:
+        """
+        Check specific tickers for settlement by querying individual markets.
+        Called from the main loop for tickers we hold positions in.
+        """
+        now = datetime.now(timezone.utc)
+        for ticker in tickers:
+            # Skip if we already know this one settled
+            with self._lock:
+                if ticker in self.settled:
+                    continue
+            try:
+                market = self.client.get_market(ticker)
+                if market.get("status") == "settled" and market.get("result") in ("yes", "no"):
+                    snap = self._parse_market(market, now)
+                    if snap:
+                        with self._lock:
+                            self.settled[snap.ticker] = snap
+                time.sleep(0.05)  # Rate limit
+            except Exception as e:
+                logger.debug(f"Settlement check for {ticker}: {e}")
 
     def _parse_market(self, m: dict, now: datetime) -> MarketSnapshot | None:
         """Parse a market dict from the API into a MarketSnapshot."""

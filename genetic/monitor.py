@@ -10,6 +10,7 @@ from genetic.evolution import evaluate_fitness
 
 if TYPE_CHECKING:
     from genetic.bot import GeneticBot
+    from genetic.feed import MarketDataFeed
 
 
 def setup_logging() -> logging.Logger:
@@ -43,23 +44,37 @@ def log_tick_progress(
     gen_num: int,
     tick_count: int,
     bots: list[GeneticBot],
+    feed: MarketDataFeed | None = None,
 ):
     """Log periodic progress during a generation."""
     elapsed_hrs = tick_count * TICK_INTERVAL_SECONDS / 3600
-    rois = [b.account.roi_pct for b in bots]
     active = sum(1 for b in bots if b.account.total_trades > 0)
     open_pos = sum(b.account.n_open for b in bots)
     total_trades = sum(b.account.total_trades for b in bots)
     total_settled = sum(b.account.n_settled for b in bots)
 
-    best = max(rois) if rois else 0
-    median = sorted(rois)[len(rois) // 2] if rois else 0
+    # Realized ROI (from settled positions)
+    realized_rois = [b.account.roi_pct for b in bots]
+    best_realized = max(realized_rois) if realized_rois else 0
+    median_realized = sorted(realized_rois)[len(realized_rois) // 2] if realized_rois else 0
+
+    # Unrealized ROI (estimated from current market prices)
+    if feed:
+        total_rois = [b.account.total_roi_pct(feed) for b in bots]
+        best_total = max(total_rois) if total_rois else 0
+        median_total = sorted(total_rois)[len(total_rois) // 2] if total_rois else 0
+        roi_str = (
+            f"Est ROI: {best_total:+.1f}%/{median_total:+.1f}% | "
+            f"Realized: {best_realized:+.1f}%/{median_realized:+.1f}%"
+        )
+    else:
+        roi_str = f"ROI: {best_realized:+.1f}%/{median_realized:+.1f}%"
 
     logger.info(
         f"[Gen {gen_num} | {elapsed_hrs:.1f}h] "
         f"Active: {active}/{len(bots)} | "
         f"Open: {open_pos} | Trades: {total_trades} | Settled: {total_settled} | "
-        f"Best ROI: {best:.1f}% | Med ROI: {median:.1f}%"
+        f"{roi_str}"
     )
 
 

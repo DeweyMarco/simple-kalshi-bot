@@ -28,5 +28,10 @@ INACTIVE_FITNESS_PENALTY = -100.0  # Fitness for bots with too few trades
 MARKET_CLOSE_WINDOW_HOURS = 24  # Only fetch markets closing within this window
 MARKET_HISTORY_MAX_TICKS = 120  # Rolling price history per market (~60 min at 30s)
 
+# --- Settlement ---
+SETTLEMENT_WAIT_HOURS = 4  # Hours to wait after trading for markets to settle
+SETTLEMENT_CHECK_TICKS = 10  # Targeted settlement check every N ticks (~5 min)
+SETTLEMENT_WAIT_POLL_SECONDS = 120  # Poll interval during settlement wait
+
 # --- Persistence ---
 STATE_DIR = Path("data/evolution")
