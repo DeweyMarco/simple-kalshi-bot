@@ -1,0 +1,16 @@
+{
+  "name": "Simple Kalshi Bot",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceFolder": "/workspace",
+  "postCreateCommand": "python3 -m pip install --upgrade pip && pip install -r requirements.txt",
+  "settings": {
+    "terminal.integrated.shell.linux": "/bin/bash"
+  },
+  "extensions": [
+    "ms-python.python",
+    "ms-python.vscode-pylance"
+  ],
+  "remoteUser": "vscode"
+}
